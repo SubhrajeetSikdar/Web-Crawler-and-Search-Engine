@@ -1,0 +1,4 @@
+[
+  {"query": "python asyncio tutorial", "relevant": {"https://example.com/asyncio-guide": 2, "https://example.com/intro-python": 1}},
+  {"query": "sqlite wal mode", "relevant": ["https://example.com/sqlite-wal"]}
+]
