@@ -8,3 +8,4 @@ RUN pip install --no-cache-dir .
 VOLUME /data
 EXPOSE 8000
 CMD ["pysearch", "serve", "--host", "0.0.0.0", "--port", "8000", "--db", "/data/pysearch.db"]
+
