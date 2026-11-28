@@ -1,103 +1,146 @@
-# PySearch
+# 🔍 PySearch
 
-An async web crawler and full-text search engine written from scratch in Python.
-It crawls sites politely, builds an inverted index in SQLite, and ranks results with
-**Okapi BM25**. Search from the CLI, a JSON API, or a small web UI.
+An async web crawler and full-text search engine written from scratch in Python. It crawls sites politely, builds a transactional inverted index in SQLite, and ranks results using **Okapi BM25**—accessible via CLI, a FastAPI JSON API, or a lightweight web UI.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Architecture & Data Flow](#architecture--data-flow)
+- [Quick Start](#quick-start)
+- [API Endpoints](#api-endpoints)
+- [Security & SSRF Protection](#security--ssrf-protection)
+- [robots.txt Handling (RFC 9309)](#robotstxt-handling-rfc-9309)
+- [Ranking & Search Quality](#ranking--search-quality)
+- [Docker](#docker)
+- [Project Layout](#project-layout)
+- [Testing](#testing)
+- [Changelog](#changelog)
+- [Roadmap](#roadmap)
+
+---
 
 ## Features
 
-- **Async crawler** (`asyncio` + `aiohttp`) with a worker pool and breadth-first frontier
-- **Polite by default**: `robots.txt` (Disallow and Crawl-delay), per-host rate limiting,
-  response size cap, timeouts, retries with backoff
-- **SSRF protection**: refuses localhost, private, link-local (cloud metadata) and other
-  non-public addresses and blocks DNS rebinding
-- **Policy-checked redirects**: every redirect target is validated (public address, same-site
-  rule, robots.txt) *before* it is requested
-- **Size limits**: oversized responses are detected and skipped, never indexed half-read
-- **Search-quality evaluation**: `pysearch eval` reports Precision@k, Recall@k, MRR and NDCG@k
-- **URL normalisation and dedup**: fragments, default ports, asset extensions, `rel=nofollow`,
-  `<meta name="robots">`, `<base href>`
-- **Inverted index** in SQLite (WAL mode) with exact-duplicate content detection and re-indexing
-- **BM25 ranking** with title boosting, a light stemmer, stopwords and a full-match bonus
-- **Snippets** built with the same stemming as the index, with highlighted matches
-- **FastAPI** JSON API and a minimal search UI
-- Fully tested without network access (the crawler takes an injectable `Fetcher`)
+- **Async crawler** (`asyncio` + `aiohttp`) with a worker pool and breadth-first frontier.
+- **Polite by default**: `robots.txt` (`Disallow` and `Crawl-delay`), per-host rate limiting, response size cap, timeouts, and retries with exponential backoff.
+- **SSRF protection**: Blocks `localhost`, `.local`, `.internal`, loopback, RFC 1918 private ranges, link-local (`169.254.169.254`), CGNAT, multicast, IPv4-mapped IPv6, numeric IP tricks (`2130706433`, `0x7f.0.0.1`), system proxies (`trust_env=False`), and DNS rebinding.
+- **Pre-hop redirect validation**: Every redirect hop is validated (public IP, same-site rule ignoring `www.`, and target `robots.txt`) *before* the request is sent.
+- **Strict size & length limits**: Oversized responses are flagged (`too_large`) and skipped rather than indexed half-read; indexed text is capped at 100,000 characters so document length, postings, and stored text stay consistent.
+- **Transactional SQLite index (WAL mode)**: Supports exact-duplicate detection, safe re-indexing in a single transaction, and removal of stale entries on `noindex`, `404`, or `410`.
+- **BM25 ranking & stemmed snippets**: Scores with title boosting (3x), full-match bonus (1.25x), stopwords, light stemming, and stem-matched highlighted snippets.
+- **Offline-ready test suite**: Injectable `Fetcher` plus unit, crawler, and local HTTP server tests (`pytest -q`).
+- **Search-quality evaluation**: `pysearch eval` computes `Precision@k`, `Recall@k`, `MRR`, and `NDCG@k`.
 
-## Architecture
+---
+
+## Architecture & Data Flow
+
+### Crawl, Index & Query Flow
 
 ```mermaid
 flowchart LR
-    Seeds --> Frontier[(URL frontier)]
-    Frontier --> Workers[Async workers]
-    Workers --> Robots[robots.txt cache]
-    Workers --> Fetcher[HTTP fetcher]
-    Fetcher --> Parser[HTML parser]
-    Parser -->|links| Frontier
-    Parser -->|title + text| Index[(SQLite inverted index)]
-    Query --> Engine[BM25 engine]
+    Seeds([Seed URLs]) --> Frontier[(URL Frontier)]
+    Frontier --> Workers[Async Workers]
+    Workers --> Robots[robots.txt Cache]
+    Workers --> Fetcher[HTTP Fetcher + DNS Guard]
+    Fetcher --> Parser[HTML Parser]
+    Parser -->|normalized links| Frontier
+    Parser -->|title + text| Index[(SQLite WAL Index)]
+
+    Query([Search Query]) --> Engine[BM25 Engine]
     Index --> Engine
-    Engine --> CLI & API[FastAPI + UI]
+    Engine --> CLI[CLI]
+    Engine --> API[FastAPI + UI]
 ```
 
-## Quick start
+### Pre-Request Redirect & SSRF Guard
+
+```mermaid
+flowchart TD
+    Req[Target URL / Redirect Hop] --> HopCap{Redirect Hops <= 5?}
+    HopCap -- No --> Block[Reject / Abort Hop]
+    HopCap -- Yes --> Addr[Public IP Check & Custom DNS]
+    Addr -- Private / Rebound --> Block
+    Addr -- Public IP --> Policy[Same-Site Rule & robots.txt]
+    Policy -- Disallowed --> Block
+    Policy -- Allowed --> Fetch[Send HTTP Request]
+```
+
+---
+
+## Quick Start
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-pysearch crawl https://docs.python.org/3/tutorial/ --max-pages 50 --max-depth 2
+pysearch crawl [https://docs.python.org/3/tutorial/](https://docs.python.org/3/tutorial/) --max-pages 50 --max-depth 2
 pysearch search "list comprehension"
-pysearch serve            # http://127.0.0.1:8000
+pysearch serve            # [http://127.0.0.1:8000](http://127.0.0.1:8000)
 ```
 
-Only crawl sites you have permission to crawl, and set a real contact URL in
-`CrawlConfig.user_agent`.
+> **Note:** Only crawl sites you are permitted to crawl, and configure a real contact URL in `CrawlConfig.user_agent`.
 
-## API
+---
+
+## API Endpoints
 
 | Endpoint | Description |
-| --- | --- |
-| `GET /search?q=...&limit=10&offset=0` | Ranked results with snippets |
-| `GET /stats` | Documents, distinct terms, average length |
-| `GET /health` | Liveness check |
-| `GET /docs` | Interactive OpenAPI docs |
+| :--- | :--- |
+| `GET /search?q=...&limit=10&offset=0` | Ranked BM25 results with highlighted snippets |
+| `GET /stats` | Indexed document count, distinct terms, and average document length |
+| `GET /health` | Service liveness check |
+| `GET /docs` | Interactive OpenAPI documentation |
 
-## Security
+---
 
-The crawler fetches arbitrary URLs, so it treats them as untrusted:
+## Security & SSRF Protection
 
-- Only public addresses are fetched. Loopback, RFC 1918, link-local (`169.254.169.254`),
-  CGNAT, multicast, IPv4-mapped IPv6, `localhost`/`.local`/`.internal` names and numeric IP
-  tricks (`2130706433`, `0x7f.0.0.1`) are rejected.
-- Redirects are followed manually (max 5). The crawler passes the fetcher a validator that is
-  called for every hop *before* the request is sent: it checks the address, the same-site rule
-  and the target's robots.txt, and a veto means the target is never contacted.
-- A custom DNS resolver drops non-public answers, so a hostname cannot rebind to an internal
-  IP after the check. System proxies are ignored (`trust_env=False`) so they cannot bypass it.
-- `--allow-private` turns the guard off for crawling a local dev server. Never use it on a
-  server that accepts crawl requests from other people.
+Because the crawler fetches arbitrary URLs, all network targets are treated as untrusted:
 
-## robots.txt handling (RFC 9309)
+- **Address filtering**: Rejects loopback, RFC 1918 private addresses, link-local addresses (`169.254.169.254`), CGNAT, multicast, IPv4-mapped IPv6, `localhost`/`.local`/`.internal` hostnames, and alternative numeric IP encodings (`2130706433`, `0x7f.0.0.1`).
+- **Pre-hop redirect policy**: Redirects are followed manually up to a maximum of 5 hops. Before each hop is issued, a validator callback verifies the resolved address, same-site boundary (ignoring `www.`), and target `robots.txt`. Any veto stops the request before contact.
+- **DNS rebinding & proxy isolation**: A custom DNS resolver discards non-public answers to prevent post-check rebinding, and environment proxies are disabled (`aiohttp` `trust_env=False`).
+- **Local development override**: Pass `--allow-private` only when crawling a local development server—never expose this flag on a service accepting untrusted external crawl requests.
 
-| robots.txt response | Behaviour |
-| --- | --- |
-| 200 | Rules are parsed and obeyed (cached 24 h) |
-| 4xx (missing) | Everything allowed |
-| 5xx, 429, network failure | Treated as disallow-all, re-checked after 5 minutes |
+---
 
-## Measuring search quality
+## robots.txt Handling (RFC 9309)
 
-Passing unit tests says nothing about relevance. To measure it, write a judgments file of real
-queries and the URLs that should answer them (see `examples/judgments.example.json`; graded
-relevance `{url: grade}` or a plain URL list), crawl your corpus, then:
+| `robots.txt` Response | Behavior |
+| :--- | :--- |
+| `200` | Rules (`Disallow`, `Crawl-delay`) are parsed and enforced; cached for 24 hours |
+| `4xx` (missing) | All paths allowed |
+| `5xx`, `429`, or network error | Treated as disallow-all; re-checked after 5 minutes |
+
+---
+
+## Ranking & Search Quality
+
+### BM25 Scoring
+
+For each query term $t$, document score is computed as:
+
+$$\text{score}(D, Q) = \sum_{t \in Q} \text{idf}(t) \cdot \frac{\text{tf} \cdot (k_1 + 1)}{\text{tf} + k_1 \cdot \left(1 - b + b \cdot \frac{\vert{}D\vert{}}{\text{avgdl}}\right)}$$
+
+- **Parameters**: $k_1 = 1.5$, $b = 0.75$
+- **Title boost**: Title tokens contribute $3\times$ toward term frequency.
+- **Full-match bonus**: Documents matching every query term receive a $1.25\times$ multiplier.
+
+### Relevance Evaluation
+
+Unit tests verify correctness, not retrieval relevance. Create a judgments JSON file mapping queries to expected URLs or graded relevance scores (`{url: grade}`—see `examples/judgments.example.json`), crawl your corpus, and run:
 
 ```bash
 pysearch eval my_judgments.json --k 10 --per-query
 # queries=120  P@10=0.412  R@10=0.780  MRR=0.655  NDCG@10=0.701  latency=1.8 ms
 ```
 
-Re-run it after every ranking change (new stemmer, field weights, hybrid search) so each
-improvement is backed by numbers. A useful set has 100+ queries labelled by a person.
+Re-run `pysearch eval` after ranking changes (stemming, field weights, hybrid search) using a human-labeled set of 100+ queries to track real impact.
+
+---
 
 ## Docker
 
@@ -106,18 +149,11 @@ docker build -t pysearch .
 docker run -p 8000:8000 -v pysearch-data:/data pysearch
 ```
 
-## How ranking works
+---
 
-For each query term, BM25 scores a document as
+## Project Layout
 
-`idf(t) * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len / avg_len))`
-
-with `k1 = 1.5`, `b = 0.75`. Title words count three times towards term frequency, and
-documents containing every query term get a 1.25x bonus.
-
-## Project layout
-
-```
+```text
 src/pysearch/
   crawler.py    workers, frontier, politeness, retries, depth and page limits
   fetcher.py    HTTP fetching with manual redirects and a public-only DNS resolver
@@ -135,50 +171,42 @@ tests/          unit, crawler, and local-server HTTP tests
 examples/       sample judgments file for `pysearch eval`
 ```
 
+---
+
 ## Testing
 
 ```bash
 pytest -q
 ```
 
+---
+
 ## Changelog
 
-**0.2.0** (fixes from a code review, each with regression tests)
+### `0.2.1`
+- Enforced redirect policy (`same-site`, `robots.txt`) **before** requesting each redirect hop via a validator callback.
+- Flagged responses exceeding `max_bytes` as `too_large` and skipped them instead of indexing truncated data; read response streams chunk-by-chunk since `StreamReader.read(n)` can return fewer than `n` bytes.
+- Made `Crawler` instances reusable across runs with fresh stats, frontier, and `robots.txt` cache (concurrent/overlapping runs on the same instance raise `RuntimeError`).
+- Capped indexed text at `100,000` characters so document length, postings, and stored text remain consistent.
+- Added `pysearch eval`, local HTTP server integration tests (redirects, caching, `robots.txt` failures, size limits), and `examples/judgments.example.json`.
 
-- Security: SSRF guard, per-hop redirect validation, DNS-rebinding protection
-- Fix: re-indexing a URL whose new content duplicated another page (or was empty) left the old
-  version searchable; replacement is now one transaction. Noindex pages and 404/410 responses
-  now remove previously indexed copies
-- Fix: robots.txt 5xx / 429 / network errors no longer mean "allow everything"
-- Fix: invalid config (for example `concurrency=0`, which hung forever) now raises `ValueError`
-- Fix: snippets now match by stem and highlight matches (safe DOM rendering in the UI)
-- Added: retries with exponential backoff, same-site matching that ignores `www.`
+### `0.2.0`
+- Added SSRF protection, pre-hop redirect checks, and DNS rebinding defenses.
+- Wrapped URL re-indexing in a single transaction so duplicate or empty updates do not leave stale versions searchable; removed previously indexed records on `noindex`, `404`, and `410`.
+- Updated `robots.txt` `5xx` / `429` / network error handling from allow-all to temporary disallow-all with a 5-minute retry window.
+- Raised `ValueError` on invalid configuration values (such as `concurrency=0`).
+- Updated snippets to match by stem and highlight matches using safe DOM rendering in the UI.
+- Added retries with exponential backoff and `www.`-insensitive same-site matching.
 
-**0.2.1** (second review)
-
-- Fix: redirect policy (same-site, robots.txt) was enforced after the redirect target had
-  already been requested; it is now checked before every hop via a validator callback
-- Fix: responses over `max_bytes` were silently truncated and indexed; they are now flagged
-  (`too_large`) and skipped. Bodies are read chunk by chunk, because `StreamReader.read(n)`
-  can return fewer than n bytes
-- Fix: a `Crawler` instance can be reused (fresh stats, frontier and robots cache per run);
-  overlapping runs on one instance raise `RuntimeError`
-- Fix: text beyond 100,000 characters is no longer indexed, so document length, postings and
-  stored text always describe the same content
-- Added: `pysearch eval`, HTTP-level tests against local servers (redirects, caching, robots
-  failures, size caps), and `examples/judgments.example.json`
+---
 
 ## Roadmap
 
 - Hybrid BM25 + embedding retrieval and reranking
 - PageRank-style link scoring
-- Field-weighted ranking (h1/h2, meta description, URL)
+- Field-weighted ranking (`h1`/`h2`, meta description, URL)
 - Phrase queries using term positions
-- Sitemap.xml discovery
+- `sitemap.xml` discovery
 - Distributed crawling with a Redis-backed frontier
-- Incremental recrawls using ETag / Last-Modified
+- Incremental recrawls using `ETag` / `Last-Modified`
 - Query suggestions and highlighting
-
-## License
-
-MIT
